@@ -12,3 +12,6 @@
 # 本地 hosts 样例（不提交，敏感内容放这里）
 samples/*.hosts
 local/
+
+tmp/
+temp/

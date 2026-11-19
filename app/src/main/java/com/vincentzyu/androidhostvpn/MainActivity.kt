@@ -4,82 +4,110 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
-import com.google.android.material.switchmaterial.SwitchMaterial
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.lifecycleScope
+import com.vincentzyu.androidhostvpn.ui.HostsVpnScreen
+import com.vincentzyu.androidhostvpn.ui.theme.AndroidHostVpnTheme
 import com.vincentzyu.androidhostvpn.vpn.HostsVpnService
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
     private companion object {
-        const val VPN_REQUEST_CODE = 1
         const val PREFS_NAME = "hosts"
     }
 
-    private lateinit var switch: SwitchMaterial
-    private lateinit var hostsEdit: android.widget.EditText
-    private lateinit var upstreamEdit: android.widget.EditText
-    private lateinit var remoteUrlEdit: android.widget.EditText
-
     private val prefs by lazy { getSharedPreferences(PREFS_NAME, MODE_PRIVATE) }
+
+    private var isVpnRunning by mutableStateOf(false)
+    private var upstreamDns by mutableStateOf("223.5.5.5")
+    private var remoteUrl by mutableStateOf("")
+    private var hostsText by mutableStateOf("")
+    private var isFetchingRemote by mutableStateOf(false)
+
+    private val vpnPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            doStartVpn()
+        } else {
+            isVpnRunning = false
+            Toast.makeText(this, "需要授予 VPN 权限才能拦截 DNS", Toast.LENGTH_LONG).show()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        switch = findViewById(R.id.vpn_switch)
-        hostsEdit = findViewById(R.id.hosts_edit)
-        upstreamEdit = findViewById(R.id.upstream_edit)
-        remoteUrlEdit = findViewById(R.id.remote_url_edit)
+        enableEdgeToEdge()
 
         loadPrefs()
 
-        switch.setOnCheckedChangeListener { _, checked ->
-            if (checked) {
-                startVpn()
-            } else {
-                stopVpn()
+        setContent {
+            AndroidHostVpnTheme {
+                HostsVpnScreen(
+                    isVpnRunning = isVpnRunning,
+                    onToggleVpn = { targetState ->
+                        if (targetState) {
+                            startVpn()
+                        } else {
+                            stopVpn()
+                        }
+                    },
+                    upstreamDns = upstreamDns,
+                    onUpstreamDnsChange = { upstreamDns = it },
+                    remoteUrl = remoteUrl,
+                    onRemoteUrlChange = { remoteUrl = it },
+                    hostsText = hostsText,
+                    onHostsTextChange = { hostsText = it },
+                    isFetchingRemote = isFetchingRemote,
+                    onFetchRemote = { fetchRemoteHosts() },
+                    onSaveAndApply = { saveAndApply() }
+                )
             }
-        }
-
-        findViewById<android.widget.Button>(R.id.save_btn).setOnClickListener {
-            savePrefs()
-            if (HostsVpnService.isRunning) {
-                sendServiceIntent(HostsVpnService.ACTION_RELOAD)
-            }
-            Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
-        }
-
-        findViewById<android.widget.Button>(R.id.fetch_remote_btn).setOnClickListener {
-            fetchRemote()
         }
     }
 
     private fun loadPrefs() {
-        hostsEdit.setText(prefs.getString("hosts_text", ""))
-        upstreamEdit.setText(prefs.getString("upstream_dns", "223.5.5.5"))
-        remoteUrlEdit.setText(prefs.getString("remote_url", ""))
-        switch.isChecked = HostsVpnService.isRunning
+        hostsText = prefs.getString("hosts_text", "") ?: ""
+        upstreamDns = prefs.getString("upstream_dns", "223.5.5.5") ?: "223.5.5.5"
+        remoteUrl = prefs.getString("remote_url", "") ?: ""
+        isVpnRunning = HostsVpnService.isRunning
     }
 
     private fun savePrefs() {
+        val cleanUpstream = upstreamDns.trim().ifEmpty { "223.5.5.5" }
         prefs.edit()
-            .putString("hosts_text", hostsEdit.text.toString())
-            .putString("upstream_dns", upstreamEdit.text.toString().trim().ifEmpty { "223.5.5.5" })
-            .putString("remote_url", remoteUrlEdit.text.toString().trim())
+            .putString("hosts_text", hostsText)
+            .putString("upstream_dns", cleanUpstream)
+            .putString("remote_url", remoteUrl.trim())
             .apply()
+    }
+
+    private fun saveAndApply() {
+        savePrefs()
+        if (HostsVpnService.isRunning) {
+            sendServiceIntent(HostsVpnService.ACTION_RELOAD)
+            Toast.makeText(this, "配置已保存并重载生效", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "配置已保存", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun startVpn() {
         savePrefs()
         val intent = VpnService.prepare(this)
         if (intent != null) {
-            startActivityForResult(intent, VPN_REQUEST_CODE)
+            vpnPermissionLauncher.launch(intent)
         } else {
             doStartVpn()
         }
@@ -87,10 +115,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun doStartVpn() {
         sendServiceIntent(HostsVpnService.ACTION_START)
+        isVpnRunning = true
     }
 
     private fun stopVpn() {
         sendServiceIntent(HostsVpnService.ACTION_STOP)
+        isVpnRunning = false
     }
 
     private fun sendServiceIntent(action: String) {
@@ -98,28 +128,18 @@ class MainActivity : AppCompatActivity() {
         startService(intent)
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == VPN_REQUEST_CODE) {
-            if (resultCode == RESULT_OK) {
-                doStartVpn()
-            } else {
-                switch.isChecked = false
-                Toast.makeText(this, "需要授权 VPN 才能生效", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-
-    private fun fetchRemote() {
-        val url = remoteUrlEdit.text.toString().trim()
-        if (url.isEmpty()) {
-            Toast.makeText(this, "请先填写远程 hosts 地址", Toast.LENGTH_SHORT).show()
+    private fun fetchRemoteHosts() {
+        val targetUrl = remoteUrl.trim()
+        if (targetUrl.isEmpty()) {
+            Toast.makeText(this, "请先输入远程 hosts 订阅地址", Toast.LENGTH_SHORT).show()
             return
         }
-        CoroutineScope(Dispatchers.Main).launch {
+
+        isFetchingRemote = true
+        lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
                 try {
-                    val conn = URL(url).openConnection() as HttpURLConnection
+                    val conn = URL(targetUrl).openConnection() as HttpURLConnection
                     conn.connectTimeout = 15000
                     conn.readTimeout = 15000
                     conn.requestMethod = "GET"
@@ -129,17 +149,19 @@ class MainActivity : AppCompatActivity() {
                     null
                 }
             }
+            isFetchingRemote = false
+
             if (result != null) {
-                hostsEdit.setText(result)
-                Toast.makeText(this@MainActivity, "已拉取远程 hosts", Toast.LENGTH_SHORT).show()
+                hostsText = result
+                Toast.makeText(this@MainActivity, "已成功拉取远程 hosts 内容", Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this@MainActivity, "拉取失败，请检查地址或网络", Toast.LENGTH_LONG).show()
+                Toast.makeText(this@MainActivity, "拉取失败，请检查网络或 URL 是否正确", Toast.LENGTH_LONG).show()
             }
         }
     }
 
     override fun onResume() {
         super.onResume()
-        switch.isChecked = HostsVpnService.isRunning
+        isVpnRunning = HostsVpnService.isRunning
     }
 }
