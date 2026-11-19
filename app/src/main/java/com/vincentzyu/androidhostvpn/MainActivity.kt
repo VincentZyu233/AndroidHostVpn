@@ -62,7 +62,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadPrefs() {
         hostsEdit.setText(prefs.getString("hosts_text", ""))
-        upstreamEdit.setText(prefs.getString("upstream_dns", "8.8.8.8"))
+        upstreamEdit.setText(prefs.getString("upstream_dns", "223.5.5.5"))
         remoteUrlEdit.setText(prefs.getString("remote_url", ""))
         switch.isChecked = HostsVpnService.isRunning
     }
@@ -70,7 +70,7 @@ class MainActivity : AppCompatActivity() {
     private fun savePrefs() {
         prefs.edit()
             .putString("hosts_text", hostsEdit.text.toString())
-            .putString("upstream_dns", upstreamEdit.text.toString().trim().ifEmpty { "8.8.8.8" })
+            .putString("upstream_dns", upstreamEdit.text.toString().trim().ifEmpty { "223.5.5.5" })
             .putString("remote_url", remoteUrlEdit.text.toString().trim())
             .apply()
     }

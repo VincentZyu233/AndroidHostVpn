@@ -2,7 +2,6 @@ package com.vincentzyu.androidhostvpn.vpn
 
 import android.content.Intent
 import android.content.SharedPreferences
-import android.net.VpnService
 import android.util.Log
 import com.vincentzyu.androidhostvpn.hosts.HostsParser
 import kotlinx.coroutines.CoroutineScope
@@ -23,7 +22,12 @@ import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 拦截 DNS 查询，匹配 hosts 则伪造应答，否则转发到真实 DNS。
+ * DNS-only 隧道服务：
+ *
+ * 系统把所有 DNS 查询发到隧道内部地址 [TUN_DNS]:53（由 addRoute 只路由这一个地址，
+ * 其余流量不受影响）。本服务从 tun0 读到 DNS 查询：
+ *   - 命中 hosts → 直接伪造应答写回 tun0
+ *   - 未命中     → 用 protect 后的 socket 转发到真实上游 DNS，收到后写回 tun0
  */
 class HostsVpnService : AbstractHostsVpnService() {
 
@@ -40,14 +44,12 @@ class HostsVpnService : AbstractHostsVpnService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var readJob: Job? = null
-    private var writeJob: Job? = null
 
-    // 每个客户端（源 IP:端口）对应一个真实 DNS 的 socket
     private val upstreamSockets = ConcurrentHashMap<String, DatagramSocket>()
 
     private lateinit var prefs: SharedPreferences
     private var hostsMap: Map<String, InetAddress> = emptyMap()
-    private var upstreamDns: String = "8.8.8.8"
+    private var upstreamDns: String = "223.5.5.5"
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -72,19 +74,19 @@ class HostsVpnService : AbstractHostsVpnService() {
 
     private fun reload() {
         val hostsText = prefs.getString("hosts_text", "") ?: ""
-        upstreamDns = prefs.getString("upstream_dns", "8.8.8.8") ?: "8.8.8.8"
+        upstreamDns = prefs.getString("upstream_dns", "223.5.5.5") ?: "223.5.5.5"
         hostsMap = try {
             HostsParser.parse(hostsText)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             emptyMap()
         }
-        Log.i(TAG, "reload: ${hostsMap.size} hosts, upstream=$upstreamDns")
+        Log.i(TAG, "reload: ${hostsMap.size} hosts, upstream=$upstreamDns, dns=$TUN_DNS")
     }
 
     private fun start() {
         if (vpnInterface != null) return
         reload()
-        val ok = establishTunnel(listOf(upstreamDns))
+        val ok = establishTunnel()
         if (!ok) {
             Log.e(TAG, "establish tunnel failed")
             stopSelf()
@@ -96,24 +98,27 @@ class HostsVpnService : AbstractHostsVpnService() {
         val input = FileInputStream(fd.fileDescriptor)
         val output = FileOutputStream(fd.fileDescriptor)
 
-        // 读线程：从隧道读入 IP 包
         readJob = scope.launch {
-            val buffer = ByteArray(32767)
+            val buffer = ByteArray(65535)
             while (isActive) {
                 val length = try {
                     input.read(buffer)
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     break
                 }
                 if (length <= 0) continue
                 val packet = buffer.copyOf(length)
-                handlePacket(packet, output)
+                try {
+                    handlePacket(packet, output)
+                } catch (e: Exception) {
+                    Log.e(TAG, "handle failed", e)
+                }
             }
         }
     }
 
     private fun handlePacket(packet: ByteArray, output: FileOutputStream) {
-        // 解析 IPv4 / IPv6 头，找到传输层协议与载荷
+        if (packet.isEmpty()) return
         val version = (packet[0].toInt() shr 4) and 0xF
         when (version) {
             4 -> handleIpv4(packet, output)
@@ -125,12 +130,10 @@ class HostsVpnService : AbstractHostsVpnService() {
         if (packet.size < 20) return
         val ihl = (packet[0].toInt() and 0x0F) * 4
         val protocol = packet[9].toInt() and 0xFF
-        val src = byteArrayOf(packet[12], packet[13], packet[14], packet[15])
-        val dst = byteArrayOf(packet[16], packet[17], packet[18], packet[19])
-        val transportOffset = ihl
+        val src = packet.copyOfRange(12, 16)
+        val dst = packet.copyOfRange(16, 20)
         when (protocol) {
-            17 -> handleUdp(packet, transportOffset, src, dst, false, output)
-            6 -> handleTcp(packet, transportOffset, src, dst, false, output)
+            17 -> handleUdp(packet, ihl, src, dst, false, output)
         }
     }
 
@@ -139,10 +142,8 @@ class HostsVpnService : AbstractHostsVpnService() {
         val nextHeader = packet[6].toInt() and 0xFF
         val src = packet.copyOfRange(8, 24)
         val dst = packet.copyOfRange(24, 40)
-        // 只处理没有扩展头的简单情况（next header 直接是 UDP/TCP）
         when (nextHeader) {
             17 -> handleUdp(packet, 40, src, dst, true, output)
-            6 -> handleTcp(packet, 40, src, dst, true, output)
         }
     }
 
@@ -155,57 +156,13 @@ class HostsVpnService : AbstractHostsVpnService() {
         output: FileOutputStream,
     ) {
         if (packet.size < udpOffset + 8) return
-        val srcPort = ((packet[udpOffset].toInt() and 0xFF) shl 8) or (packet[udpOffset + 1].toInt() and 0xFF)
-        val dstPort = ((packet[udpOffset + 2].toInt() and 0xFF) shl 8) or (packet[udpOffset + 3].toInt() and 0xFF)
+        val srcPort = u16(packet, udpOffset)
+        val dstPort = u16(packet, udpOffset + 2)
         if (dstPort != 53) return
 
         val dnsOffset = udpOffset + 8
+        if (packet.size <= dnsOffset) return
         val dnsQuery = packet.copyOfRange(dnsOffset, packet.size)
-        val name = DnsPacket.parseQueryName(dnsQuery)
-
-        if (name == null) {
-            forwardToUpstream(packet, output, src, srcPort, dst, dstPort, isV6)
-            return
-        }
-
-        // 匹配 hosts
-        val answer = hostsMap[name]
-        if (answer != null) {
-            val resp = DnsPacket.buildResponse(dnsQuery, answer)
-            if (resp != null) {
-                val out = buildUdpPacket(packet, udpOffset, src, dst, srcPort, dstPort, isV6, resp)
-                writePacket(out, output)
-                return
-            }
-        }
-
-        forwardToUpstream(packet, output, src, srcPort, dst, dstPort, isV6)
-    }
-
-    private fun handleTcp(
-        packet: ByteArray,
-        tcpOffset: Int,
-        src: ByteArray,
-        dst: ByteArray,
-        isV6: Boolean,
-        output: FileOutputStream,
-    ) {
-        if (packet.size < tcpOffset + 20) return
-        val dataOffset = ((packet[tcpOffset + 12].toInt() shr 4) and 0x0F) * 4
-        val srcPort = ((packet[tcpOffset].toInt() and 0xFF) shl 8) or (packet[tcpOffset + 1].toInt() and 0xFF)
-        val dstPort = ((packet[tcpOffset + 2].toInt() and 0xFF) shl 8) or (packet[tcpOffset + 3].toInt() and 0xFF)
-        if (dstPort != 53) return
-
-        val flags = ((packet[tcpOffset + 12].toInt() and 0xFF) shl 8) or (packet[tcpOffset + 13].toInt() and 0xFF)
-        val syn = flags and 0x02 != 0
-        if (syn) {
-            // TCP DNS 暂不处理 SYN 握手，直接丢弃（大多数客户端回退到 UDP）
-            return
-        }
-        val dnsOffset = tcpOffset + dataOffset
-        if (packet.size <= dnsOffset + 2) return
-        // TCP DNS 前面有 2 字节长度前缀
-        val dnsQuery = packet.copyOfRange(dnsOffset + 2, packet.size)
         val name = DnsPacket.parseQueryName(dnsQuery)
 
         if (name != null) {
@@ -213,39 +170,39 @@ class HostsVpnService : AbstractHostsVpnService() {
             if (answer != null) {
                 val resp = DnsPacket.buildResponse(dnsQuery, answer)
                 if (resp != null) {
-                    val dnsWithLen = ByteBuffer.allocate(2 + resp.size).order(ByteOrder.BIG_ENDIAN)
-                        .putShort(resp.size.toShort()).put(resp).array()
-                    val out = buildTcpPacket(packet, tcpOffset, src, dst, srcPort, dstPort, isV6, dnsWithLen)
+                    Log.i(TAG, "hit hosts: $name -> ${answer.hostAddress}")
+                    val out = buildUdpPacket(src, dst, srcPort, dstPort, isV6, resp)
                     writePacket(out, output)
                     return
                 }
             }
         }
-        // TCP DNS 转发未实现，直接丢弃（客户端会回退 UDP）
+
+        // 未命中：转发到真实 DNS
+        forwardToUpstream(dnsQuery, src, srcPort, dstPort, isV6, output, name)
     }
 
     private fun forwardToUpstream(
-        packet: ByteArray,
-        output: FileOutputStream,
-        src: ByteArray,
-        srcPort: Int,
-        dst: ByteArray,
-        dstPort: Int,
+        dnsQuery: ByteArray,
+        clientSrc: ByteArray,
+        clientPort: Int,
+        dnsPort: Int,
         isV6: Boolean,
+        output: FileOutputStream,
+        name: String?,
     ) {
-        // 提取原始 DNS 载荷，交给真实 DNS，收到应答再封装回 IP 包
-        val udpOffset = if (isV6) 40 else ((packet[0].toInt() and 0x0F) * 4)
-        val dnsOffset = udpOffset + 8
-        val dnsQuery = packet.copyOfRange(dnsOffset, packet.size)
-        if (dnsQuery.isEmpty()) return
-
-        val key = InetAddress.getByAddress(src).hostAddress + ":" + srcPort
-        val socket = upstreamSockets.getOrPut(key) {
-            try {
-                DatagramSocket().apply { soTimeout = 15000 }
-            } catch (e: Exception) {
+        val key = InetAddress.getByAddress(clientSrc).hostAddress + ":" + clientPort
+        val socket = upstreamSockets[key] ?: run {
+            val s = try {
+                DatagramSocket().apply { soTimeout = 10000 }
+            } catch (_: Exception) {
                 null
             }
+            if (s != null) {
+                protectSocket(s) // 关键：转发流量不走隧道
+                upstreamSockets[key] = s
+            }
+            s
         } ?: return
 
         scope.launch {
@@ -256,90 +213,73 @@ class HostsVpnService : AbstractHostsVpnService() {
                 val recv = DatagramPacket(buf, buf.size)
                 socket.receive(recv)
                 val respData = recv.data.copyOfRange(recv.offset, recv.offset + recv.length)
-                val out = buildUdpPacket(packet, udpOffset, src, dst, srcPort, dstPort, isV6, respData)
+                Log.i(TAG, "forward: $name -> upstream(${respData.size}B)")
+                val out = buildUdpPacket(clientSrc, dnsIpBytes(isV6), clientPort, dnsPort, isV6, respData)
                 writePacket(out, output)
-            } catch (e: Exception) {
-                // 超时或错误，丢弃
+            } catch (_: Exception) {
+                // 超时/错误丢弃
             }
         }
     }
 
+    /** 构造发回给客户端的 UDP over IP 包（源=tunnel dns，目的=客户端） */
     private fun buildUdpPacket(
-        original: ByteArray,
-        udpOffset: Int,
-        src: ByteArray,
-        dst: ByteArray,
-        srcPort: Int,
-        dstPort: Int,
+        clientIp: ByteArray,
+        dnsIp: ByteArray,
+        clientPort: Int,
+        dnsPort: Int,
         isV6: Boolean,
         dnsPayload: ByteArray,
     ): ByteArray {
-        val is6 = isV6
-        val ipHeaderSize = if (is6) 40 else ((original[0].toInt() and 0x0F) * 4)
+        val ipHeaderSize = if (isV6) 40 else 20
         val udpLen = 8 + dnsPayload.size
         val totalLen = ipHeaderSize + udpLen
-
         val out = ByteArray(totalLen)
 
-        if (is6) {
-            out[0] = 0x60.toByte() // version=6
-            out[6] = 17 // next header = UDP
-            out[7] = 64 // hop limit
-            System.arraycopy(dst, 0, out, 8, 16)  // 源地址=原目的地址
-            System.arraycopy(src, 0, out, 24, 16) // 目的地址=原源地址
-            // payload length
+        if (isV6) {
+            out[0] = 0x60
+            out[6] = 17 // UDP
+            out[7] = 64
             out[4] = ((udpLen shr 8) and 0xFF).toByte()
             out[5] = (udpLen and 0xFF).toByte()
+            System.arraycopy(dnsIp, 0, out, 8, 16)   // 源 = DNS 服务器（隧道地址）
+            System.arraycopy(clientIp, 0, out, 24, 16) // 目的 = 客户端
         } else {
-            out[0] = 0x45 // version=4, ihl=5
+            out[0] = 0x45
             out[8] = 64 // TTL
-            out[9] = 17 // protocol = UDP
-            // total length
+            out[9] = 17 // UDP
             out[2] = ((totalLen shr 8) and 0xFF).toByte()
             out[3] = (totalLen and 0xFF).toByte()
-            System.arraycopy(dst, 0, out, 12, 4) // 源地址
-            System.arraycopy(src, 0, out, 16, 4) // 目的地址
-            // 校验和交给系统（置 0）
+            System.arraycopy(dnsIp, 0, out, 12, 4)
+            System.arraycopy(clientIp, 0, out, 16, 4)
         }
 
-        val u = udpOffset
         val t = ipHeaderSize
-        // UDP 头：源端口=原目的端口，目的端口=原源端口
-        out[t] = ((dstPort shr 8) and 0xFF).toByte()
-        out[t + 1] = (dstPort and 0xFF).toByte()
-        out[t + 2] = ((srcPort shr 8) and 0xFF).toByte()
-        out[t + 3] = (srcPort and 0xFF).toByte()
-        // UDP 长度
+        val us = dnsPort
+        val ud = clientPort
+        out[t] = ((us shr 8) and 0xFF).toByte()
+        out[t + 1] = (us and 0xFF).toByte()
+        out[t + 2] = ((ud shr 8) and 0xFF).toByte()
+        out[t + 3] = (ud and 0xFF).toByte()
         out[t + 4] = ((udpLen shr 8) and 0xFF).toByte()
         out[t + 5] = (udpLen and 0xFF).toByte()
-        // UDP 校验和置 0（多数系统对 0 校验和容忍，IPv6 下需计算）
-        out[t + 6] = 0
-        out[t + 7] = 0
-
         System.arraycopy(dnsPayload, 0, out, t + 8, dnsPayload.size)
 
-        // IPv4 头部校验和
-        if (!is6) {
+        if (!isV6) {
             val checksum = ipv4Checksum(out, 0, ipHeaderSize)
             out[10] = ((checksum shr 8) and 0xFF).toByte()
             out[11] = (checksum and 0xFF).toByte()
         }
-
         return out
     }
 
-    private fun buildTcpPacket(
-        original: ByteArray,
-        tcpOffset: Int,
-        src: ByteArray,
-        dst: ByteArray,
-        srcPort: Int,
-        dstPort: Int,
-        isV6: Boolean,
-        dnsPayload: ByteArray,
-    ): ByteArray {
-        // TCP DNS 应答构造较复杂，这里简化：不返回有效包（客户端回退 UDP）
-        return ByteArray(0)
+    private fun dnsIpBytes(isV6: Boolean): ByteArray {
+        val addr = InetAddress.getByName(TUN_DNS)
+        return addr.address
+    }
+
+    private fun u16(data: ByteArray, off: Int): Int {
+        return ((data[off].toInt() and 0xFF) shl 8) or (data[off + 1].toInt() and 0xFF)
     }
 
     private fun ipv4Checksum(data: ByteArray, offset: Int, length: Int): Int {
@@ -347,16 +287,11 @@ class HostsVpnService : AbstractHostsVpnService() {
         var i = offset
         val end = offset + length
         while (i + 1 < end) {
-            val word = ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            sum += word
+            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
             i += 2
         }
-        if (i < end) {
-            sum += (data[i].toInt() and 0xFF) shl 8
-        }
-        while (sum shr 16 != 0) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        }
+        if (i < end) sum += (data[i].toInt() and 0xFF) shl 8
+        while (sum shr 16 != 0) sum = (sum and 0xFFFF) + (sum shr 16)
         return sum.inv() and 0xFFFF
     }
 
@@ -372,7 +307,6 @@ class HostsVpnService : AbstractHostsVpnService() {
     override fun onDestroy() {
         isRunning = false
         readJob?.cancel()
-        writeJob?.cancel()
         scope.cancel()
         for (s in upstreamSockets.values) {
             try { s.close() } catch (_: Exception) {}
