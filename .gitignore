@@ -1,0 +1,14 @@
+*.iml
+.gradle
+/local.properties
+.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+*.aab
+# 本地 hosts 样例（不提交，敏感内容放这里）
+samples/*.hosts
+local/
